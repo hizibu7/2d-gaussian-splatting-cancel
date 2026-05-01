@@ -37,6 +37,9 @@ def step(it, g, photo_loss, viewpoint_cam, mp, K=1000):
     summed_m = lg["mean2D"].norm(dim=-1) if lg.get("mean2D") is not None else torch.zeros_like(sum_t)
     sum_m = bufs["mean2D"]
     cancel_m = 1.0 - summed_m / (sum_m + 1e-8)
+    sx_m = bufs.get("mean2D_sx", torch.zeros_like(sum_m)); sy_m = bufs.get("mean2D_sy", torch.zeros_like(sum_m))
+    signed_m = torch.sqrt(sx_m**2 + sy_m**2)
+    cancel_m2d = 1.0 - signed_m / (sum_m + 1e-8)
     summed_op = lg["opacity"].abs().squeeze(-1) if lg.get("opacity") is not None else torch.zeros_like(sum_t)
     sum_op = bufs["opacity"]
     cancel_op = 1.0 - summed_op / (sum_op + 1e-8)
@@ -59,6 +62,10 @@ def step(it, g, photo_loss, viewpoint_cam, mp, K=1000):
     rec["summed_t_norm"] = summed_t[idx].detach().cpu().numpy().astype(np.float32)
     rec["sum_m"] = sum_m[idx].detach().cpu().numpy().astype(np.float32)
     rec["summed_m_norm"] = summed_m[idx].detach().cpu().numpy().astype(np.float32)
+    rec["sx_m"] = sx_m[idx].detach().cpu().numpy().astype(np.float32)
+    rec["sy_m"] = sy_m[idx].detach().cpu().numpy().astype(np.float32)
+    rec["signed_m"] = signed_m[idx].detach().cpu().numpy().astype(np.float32)
+    rec["cancel_m2d"] = cancel_m2d[idx].detach().cpu().numpy().astype(np.float32)
     rec["sum_op"] = sum_op[idx].detach().cpu().numpy().astype(np.float32)
     rec["summed_op_norm"] = summed_op[idx].detach().cpu().numpy().astype(np.float32)
     rec["mean_d"] = mean_d[idx].detach().cpu().numpy().astype(np.float32)
