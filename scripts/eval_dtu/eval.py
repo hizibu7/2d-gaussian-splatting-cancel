@@ -155,12 +155,31 @@ if __name__ == '__main__':
     pbar.set_description('done')
     pbar.close()
     over_all = (mean_d2s + mean_s2d) / 2
+
+    # F-score at multiple thresholds
+    fscore_thresholds = [0.5, 1.0, 2.0]  # mm
+    fscores = {}
+    for tau in fscore_thresholds:
+        # Precision: fraction of predicted points within tau of GT
+        precision = (dist_d2s[dist_d2s < max_dist] < tau).mean()
+        # Recall: fraction of GT points within tau of predicted
+        recall = (dist_s2d[dist_s2d < max_dist] < tau).mean()
+        if precision + recall > 0:
+            f1 = 2 * precision * recall / (precision + recall)
+        else:
+            f1 = 0.0
+        fscores[f'f{tau}'] = {'precision': float(precision), 'recall': float(recall), 'fscore': float(f1)}
+
     print(mean_d2s, mean_s2d, over_all)
-    
+    for tau in fscore_thresholds:
+        fs = fscores[f'f{tau}']
+        print(f"  F-score@{tau}mm: P={fs['precision']:.4f} R={fs['recall']:.4f} F={fs['fscore']:.4f}")
+
     import json
     with open(f'{args.vis_out_dir}/results.json', 'w') as fp:
         json.dump({
             'mean_d2s': mean_d2s,
             'mean_s2d': mean_s2d,
             'overall': over_all,
+            **fscores,
         }, fp, indent=True)

@@ -53,8 +53,13 @@ class GaussianModel:
         self.max_radii2D = torch.empty(0)
         self.xyz_gradient_accum = torch.empty(0)
         self.denom = torch.empty(0)
+        self.cumulative_view_count = torch.empty(0)  # Never reset, tracks total visibility
+        self.sfm_nn_distance = torch.empty(0)
+        self.initial_scale = torch.empty(0)  # [N, 2] for loop-preventive densification  # SfM NN distance prior (fixed at init)
         self.optimizer = None
         self.percent_dense = 0
+        self.gauss_id = torch.empty(0, dtype=torch.long)
+        self.next_id = 0  # Counter for assigning new IDs
         self.spatial_lr_scale = 0
         self.setup_functions()
 
@@ -121,7 +126,7 @@ class GaussianModel:
         if self.active_sh_degree < self.max_sh_degree:
             self.active_sh_degree += 1
 
-    def create_from_pcd(self, pcd : BasicPointCloud, spatial_lr_scale : float):
+    def create_from_pcd(self, pcd : BasicPointCloud, spatial_lr_scale : float, scale_init_cap : float = 0.0):
         self.spatial_lr_scale = spatial_lr_scale
         fused_point_cloud = torch.tensor(np.asarray(pcd.points)).float().cuda()
         fused_color = RGB2SH(torch.tensor(np.asarray(pcd.colors)).float().cuda())
@@ -132,7 +137,15 @@ class GaussianModel:
         print("Number of points at initialisation : ", fused_point_cloud.shape[0])
 
         dist2 = torch.clamp_min(distCUDA2(torch.from_numpy(np.asarray(pcd.points)).float().cuda()), 0.0000001)
-        scales = torch.log(torch.sqrt(dist2))[...,None].repeat(1, 2)
+        scales_raw = torch.sqrt(dist2)
+        self.sfm_nn_distance = scales_raw.detach().clone()  # Fixed SfM geometric prior
+        # SfM-aware initialization: cap outlier scales to prevent self-reinforcing loop
+        if scale_init_cap > 0:
+            cap = scales_raw.median() * scale_init_cap
+            n_capped = (scales_raw > cap).sum().item()
+            scales_raw = torch.clamp(scales_raw, max=cap.item())
+            print(f"[ScaleInitCap] median={scales_raw.median():.6f}, cap={cap:.6f}, capped={n_capped}/{len(scales_raw)}")
+        scales = torch.log(scales_raw)[...,None].repeat(1, 2)
         rots = torch.rand((fused_point_cloud.shape[0], 4), device="cuda")
 
         opacities = self.inverse_opacity_activation(0.1 * torch.ones((fused_point_cloud.shape[0], 1), dtype=torch.float, device="cuda"))
@@ -144,11 +157,15 @@ class GaussianModel:
         self._rotation = nn.Parameter(rots.requires_grad_(True))
         self._opacity = nn.Parameter(opacities.requires_grad_(True))
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
+        N = self.get_xyz.shape[0]
+        self.gauss_id = torch.arange(N, device="cuda", dtype=torch.long)
+        self.next_id = N
 
     def training_setup(self, training_args):
         self.percent_dense = training_args.percent_dense
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
+        self.cumulative_view_count = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
 
         l = [
             {'params': [self._xyz], 'lr': training_args.position_lr_init * self.spatial_lr_scale, "name": "xyz"},
@@ -298,10 +315,18 @@ class GaussianModel:
         self._scaling = optimizable_tensors["scaling"]
         self._rotation = optimizable_tensors["rotation"]
 
+        if self.gauss_id.shape[0] > 0:
+            self.gauss_id = self.gauss_id[valid_points_mask]
         self.xyz_gradient_accum = self.xyz_gradient_accum[valid_points_mask]
 
         self.denom = self.denom[valid_points_mask]
         self.max_radii2D = self.max_radii2D[valid_points_mask]
+        if self.cumulative_view_count.shape[0] > 0:
+            self.cumulative_view_count = self.cumulative_view_count[valid_points_mask]
+        if self.sfm_nn_distance.numel() > 0:
+            self.sfm_nn_distance = self.sfm_nn_distance[valid_points_mask]
+        if self.initial_scale.numel() > 0:
+            self.initial_scale = self.initial_scale[valid_points_mask]
 
     def cat_tensors_to_optimizer(self, tensors_dict):
         optimizable_tensors = {}
@@ -344,8 +369,30 @@ class GaussianModel:
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
+        n_existing = self.gauss_id.shape[0]
+        n_new = self.get_xyz.shape[0] - n_existing
+        if n_new > 0:
+            new_ids = torch.arange(self.next_id, self.next_id + n_new, device="cuda", dtype=torch.long)
+            self.gauss_id = torch.cat([self.gauss_id, new_ids])
+            self.next_id += n_new
+        # Extend cumulative_view_count for new Gaussians (0 initial), do NOT reset existing
+        if self.cumulative_view_count.shape[0] > 0:
+            n_new = self.get_xyz.shape[0] - self.cumulative_view_count.shape[0]
+            if n_new > 0:
+                self.cumulative_view_count = torch.cat([
+                    self.cumulative_view_count,
+                    torch.zeros((n_new, 1), device="cuda")
+                ], dim=0)
 
-    def densify_and_split(self, grads, grad_threshold, scene_extent, N=2):
+        # Extend initial_scale: new Gaussians get current scale as their initial
+        if self.initial_scale.numel() > 0:
+            n_new = self.get_xyz.shape[0] - self.initial_scale.shape[0]
+            if n_new > 0:
+                # New Gaussians (from split/clone) start fresh with current scale
+                new_init_scale = self.get_scaling[-n_new:].detach().clone()
+                self.initial_scale = torch.cat([self.initial_scale, new_init_scale], dim=0)
+
+    def densify_and_split(self, grads, grad_threshold, scene_extent, N=2, force_split_mask=None):
         n_init_points = self.get_xyz.shape[0]
         # Extract points that satisfy the gradient condition
         padded_grad = torch.zeros((n_init_points), device="cuda")
@@ -353,6 +400,11 @@ class GaussianModel:
         selected_pts_mask = torch.where(padded_grad >= grad_threshold, True, False)
         selected_pts_mask = torch.logical_and(selected_pts_mask,
                                               torch.max(self.get_scaling, dim=1).values > self.percent_dense*scene_extent)
+        # Force-split: large scale + low confidence, regardless of gradient
+        if force_split_mask is not None:
+            padded_force = torch.zeros((n_init_points), dtype=torch.bool, device="cuda")
+            padded_force[:force_split_mask.shape[0]] = force_split_mask
+            selected_pts_mask = torch.logical_or(selected_pts_mask, padded_force)
 
         stds = self.get_scaling[selected_pts_mask].repeat(N,1)
         stds = torch.cat([stds, 0 * torch.ones_like(stds[:,:1])], dim=-1)
@@ -366,10 +418,17 @@ class GaussianModel:
         new_features_rest = self._features_rest[selected_pts_mask].repeat(N,1,1)
         new_opacity = self._opacity[selected_pts_mask].repeat(N,1)
 
+        _split_sfm_nn = self.sfm_nn_distance[selected_pts_mask].repeat(N) if self.sfm_nn_distance.numel() > 0 else None
         self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacity, new_scaling, new_rotation)
+        if _split_sfm_nn is not None:
+            self.sfm_nn_distance = torch.cat([self.sfm_nn_distance, _split_sfm_nn])
 
         prune_filter = torch.cat((selected_pts_mask, torch.zeros(N * selected_pts_mask.sum(), device="cuda", dtype=bool)))
         self.prune_points(prune_filter)
+
+    def set_initial_scale(self):
+        """Store current scale as initial reference for loop detection."""
+        self.initial_scale = self.get_scaling.detach().clone()  # [N, 2]
 
     def densify_and_clone(self, grads, grad_threshold, scene_extent):
         # Extract points that satisfy the gradient condition
@@ -384,14 +443,68 @@ class GaussianModel:
         new_scaling = self._scaling[selected_pts_mask]
         new_rotation = self._rotation[selected_pts_mask]
 
+        _clone_sfm_nn = self.sfm_nn_distance[selected_pts_mask] if self.sfm_nn_distance.numel() > 0 else None
         self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation)
+        if _clone_sfm_nn is not None:
+            self.sfm_nn_distance = torch.cat([self.sfm_nn_distance, _clone_sfm_nn])
 
-    def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size):
+    def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size, consistency_mask=None, scale_normalize=False, confidence_gated_densify=False, confidence_scores=None, scale_confidence_split=False, sc_scale_percentile=90, sc_conf_threshold=0.3, sc_max_count=500):
         grads = self.xyz_gradient_accum / self.denom
         grads[grads.isnan()] = 0.0
 
+        # Scale-normalized gradient: compensate for gradient attenuation in large Gaussians
+        if scale_normalize:
+            max_scale = self.get_scaling.max(dim=1).values.unsqueeze(1)  # [N, 1]
+            # Normalize: large scale → boost gradient, small scale → keep as-is
+            # Use median as reference to avoid extreme values
+            scale_median = max_scale.median()
+            scale_factor = (max_scale / (scale_median + 1e-8)).clamp(1.0, 100.0)  # only boost, never reduce
+            grads = grads * scale_factor
+
+        # Confidence-gated scale normalization: only boost low-confidence (pathological) Gaussians
+        if confidence_gated_densify and confidence_scores is not None:
+            n = min(grads.shape[0], confidence_scores.shape[0])
+            max_scale = self.get_scaling.max(dim=1).values.unsqueeze(1)[:n]
+            scale_median = max_scale.median()
+            scale_factor = (max_scale / (scale_median + 1e-8)).clamp(1.0, 50.0)
+            # Only apply boost to low-confidence Gaussians (confidence < 0.5)
+            gate = (confidence_scores[:n] < 0.5).float()
+            gated_factor = 1.0 + (scale_factor - 1.0) * gate
+            grads[:n] = grads[:n] * gated_factor
+
+        # If consistency_mask provided, zero out gradients for low-consistency Gaussians
+        # This prevents them from being densified (both clone and split check grad >= threshold)
+        if consistency_mask is not None:
+            n = min(grads.shape[0], consistency_mask.shape[0])
+            blocked = ~consistency_mask[:n]
+            grads[:n][blocked] = 0.0
+
+        # Scale-Confidence forced split: split large + low-confidence Gaussians
+        # regardless of gradient. This breaks the self-reinforcing loop directly.
+        force_mask = None
+        if scale_confidence_split and confidence_scores is not None:
+            N = self._xyz.shape[0]
+            max_scale = self.get_scaling.max(dim=1).values  # [N]
+            scale_th = torch.quantile(max_scale, sc_scale_percentile / 100.0)
+            large = max_scale > scale_th
+            n = min(N, confidence_scores.shape[0])
+            low_conf = torch.zeros(N, dtype=torch.bool, device="cuda")
+            low_conf[:n] = confidence_scores[:n] < sc_conf_threshold
+            force_mask = large & low_conf
+            if force_mask.sum() > 0:
+                print(f"[Scale-Conf Split] force split {force_mask.sum().item()} Gaussians (scale_th={scale_th:.4f}, conf_th={sc_conf_threshold})")
+            # Cap to avoid memory explosion
+            if force_mask.sum() > sc_max_count:
+                # Keep the ones with highest scale
+                candidates = torch.where(force_mask)[0]
+                scales_cand = max_scale[candidates]
+                _, topk_idx = scales_cand.topk(sc_max_count)
+                new_mask = torch.zeros(N, dtype=torch.bool, device="cuda")
+                new_mask[candidates[topk_idx]] = True
+                force_mask = new_mask
+
         self.densify_and_clone(grads, max_grad, extent)
-        self.densify_and_split(grads, max_grad, extent)
+        self.densify_and_split(grads, max_grad, extent, force_split_mask=force_mask)
 
         prune_mask = (self.get_opacity < min_opacity).squeeze()
         if max_screen_size:
@@ -405,3 +518,5 @@ class GaussianModel:
     def add_densification_stats(self, viewspace_point_tensor, update_filter):
         self.xyz_gradient_accum[update_filter] += torch.norm(viewspace_point_tensor.grad[update_filter], dim=-1, keepdim=True)
         self.denom[update_filter] += 1
+        if self.cumulative_view_count.shape[0] > 0:
+            self.cumulative_view_count[update_filter] += 1

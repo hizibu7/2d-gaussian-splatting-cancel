@@ -137,14 +137,17 @@ class GaussianExtractor(object):
         print(f"Use at least {2.0 * self.radius:.2f} for depth_trunc")
 
     @torch.no_grad()
-    def extract_mesh_bounded(self, voxel_size=0.004, sdf_trunc=0.02, depth_trunc=3, mask_backgrond=True):
+    def extract_mesh_bounded(self, voxel_size=0.004, sdf_trunc=0.02, depth_trunc=3, mask_backgrond=True,
+                             confidence_maps=None, conf_threshold=0.3):
         """
         Perform TSDF fusion given a fixed depth range, used in the paper.
-        
+
         voxel_size: the voxel size of the volume
         sdf_trunc: truncation value
         depth_trunc: maximum depth range, should depended on the scene's scales
         mask_backgrond: whether to mask backgroud, only works when the dataset have masks
+        confidence_maps: optional list of [1, H, W] confidence maps per view
+        conf_threshold: pixels with confidence below this are masked out
 
         return o3d.mesh
         """
@@ -152,6 +155,8 @@ class GaussianExtractor(object):
         print(f'voxel_size: {voxel_size}')
         print(f'sdf_trunc: {sdf_trunc}')
         print(f'depth_truc: {depth_trunc}')
+        if confidence_maps is not None:
+            print(f'confidence_tsdf: threshold={conf_threshold}')
 
         volume = o3d.pipelines.integration.ScalableTSDFVolume(
             voxel_length= voxel_size,
@@ -159,13 +164,23 @@ class GaussianExtractor(object):
             color_type=o3d.pipelines.integration.TSDFVolumeColorType.RGB8
         )
 
+        n_masked_total = 0
+        n_pixels_total = 0
         for i, cam_o3d in tqdm(enumerate(to_cam_open3d(self.viewpoint_stack)), desc="TSDF integration progress"):
             rgb = self.rgbmaps[i]
             depth = self.depthmaps[i]
-            
+
             # if we have mask provided, use it
             if mask_backgrond and (self.viewpoint_stack[i].gt_alpha_mask is not None):
                 depth[(self.viewpoint_stack[i].gt_alpha_mask < 0.5)] = 0
+
+            # Confidence masking: zero out depth for low-confidence pixels
+            if confidence_maps is not None:
+                conf_map = confidence_maps[i]  # [1, H, W]
+                low_conf_mask = conf_map[0] < conf_threshold  # [H, W]
+                depth[0][low_conf_mask] = 0
+                n_masked_total += low_conf_mask.sum().item()
+                n_pixels_total += low_conf_mask.numel()
 
             # make open3d rgbd
             rgbd = o3d.geometry.RGBDImage.create_from_color_and_depth(
@@ -176,6 +191,9 @@ class GaussianExtractor(object):
             )
 
             volume.integrate(rgbd, intrinsic=cam_o3d.intrinsic, extrinsic=cam_o3d.extrinsic)
+
+        if confidence_maps is not None:
+            print(f"Confidence TSDF: masked {n_masked_total}/{n_pixels_total} pixels ({100*n_masked_total/max(n_pixels_total,1):.1f}%)")
 
         mesh = volume.extract_triangle_mesh()
         return mesh
