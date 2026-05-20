@@ -86,6 +86,20 @@ class OptimizationParams(ParamGroup):
         self.lambda_dist = 0.0
         self.lambda_normal = 0.05
         self.opacity_cull = 0.05
+        self.cancel_loss_lambda = 0.0
+        self.cancel_loss_K = 200
+        self.cancel_loss_start = 7000
+        self.cancel_loss_radii_min = 5
+        self.cancel_composite_densify = False
+        self.cancel_composite_grad_threshold = 0.0001
+        # Phase 1 method dispatch
+        self.densify_method = 'V'  # V | OR_cancel | OR_random | AND_cancel | AND_random | AbsGS
+        self.cancel_rank_threshold = 0.7  # top (1 - thr) fraction of candidate pool
+        self.method_random_seed = 0
+        self.argmin_clamp_factor = 1.5
+        # Cancel-as-split-direction (Phase 2)
+        self.split_method = 'V'  # V | cancel | random_dir | orthogonal_dir
+        self.split_offset_scale = 1.0  # offset magnitude as multiple of max scale
 
         self.densification_interval = 100
         self.opacity_reset_interval = 3000
@@ -147,6 +161,26 @@ class OptimizationParams(ParamGroup):
         self.log_cancel_v8 = False
         self.log_cancel_v9 = False
         self.log_cancel_v10 = False
+        self.log_cancel_v11 = False
+        self.log_cancel_perloss = False
+        self.prune_cancel_iter = 0
+        self.mid_intervene_mode = "none"
+        self.mid_intervene_module = "mid_intervene_render"
+        self.mid_intervene_start = 15001
+        self.mid_intervene_end = 28001
+        self.mid_intervene_step = 1000
+        self.cancel_amplify_gamma = 0.0
+        self.cancel_amplify_start = 5000
+        self.cancel_amplify_interval = 500
+        self.cancel_amplify_cm_thr = 0.7
+        self.cancel_amplify_g_abs_mean_min = 1e-7
+        self.cancel_amplify_nr_min = 10
+        self.log_perview = False
+        self.perview_anchors = "3000,7000,14000"
+        self.perview_n_sample = 1000
+        self.gt_depth_dir = ""
+        self.v11_k = 3.0
+        self.v11_n_samples = 256
         self.exp_b_risk_rot = False
         self.exp_b_max_detach = 0.5
         self.exp_c_risk_dist = False

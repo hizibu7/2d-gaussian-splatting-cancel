@@ -14,6 +14,8 @@ import torch
 import torch.nn.functional as F
 from random import randint
 from utils.loss_utils import l1_loss, ssim
+from cancel_loss_proxy import L_cancel_proxy
+from cancel_split_direction import (compute_cancel_directions, sample_random_unit_directions, orthogonalize_directions, project_to_tangent_plane, compute_cancel_argmin_offsets, sample_tangent_random_directions, project_to_tangent_plane_keep_magnitude, clamp_offset_to_parent_footprint)
 from gaussian_renderer import render, network_gui
 import sys
 from scene import Scene, GaussianModel
@@ -36,6 +38,10 @@ import traj_log_cancel_v7
 import traj_log_cancel_v8
 import traj_log_cancel_v9
 import traj_log_cancel_v10
+import traj_log_cancel_v11
+import traj_log_cancel_perloss
+import cancel_prune
+import traj_log_perview
 try:
     from torch.utils.tensorboard import SummaryWriter
     TENSORBOARD_FOUND = True
@@ -997,8 +1003,13 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     ps_color_conf = None
     ps_normal_conf = None
 
+    if opt.log_cancel_v11:
+        traj_log_cancel_v11.init(scene.model_path, opt.gt_depth_dir if opt.gt_depth_dir else None, scene.getTrainCameras(), render, pipe, background, k=opt.v11_k, n_samples=opt.v11_n_samples)
+    if opt.log_perview:
+        traj_log_perview.init(scene.model_path, scene.getTrainCameras(), render, pipe, background, n_sample=opt.perview_n_sample, anchors=tuple(int(x) for x in opt.perview_anchors.split(",")))
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
     first_iter += 1
+    cancel_amp_mask = None
     for iteration in range(first_iter, opt.iterations + 1):
 
         iter_start.record()
@@ -1179,9 +1190,25 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     ema['var'] = (1 - alpha) * ema['var'] + alpha * delta ** 2
                     ema['count'] += 1
 
+        # Candidate 5 / Phase 1: ensure cancel buffers sized for current gauss count
+        if opt.cancel_composite_densify or opt.densify_method in ('OR_cancel', 'AND_cancel', 'AbsGS'):
+            import diff_surfel_rasterization as _dsr_set
+            _dsr_set.set_cancel_buffers(gaussians._xyz.shape[0], gaussians._xyz.device)
         gt_image = viewpoint_cam.original_image.cuda()
         Ll1 = l1_loss(image, gt_image)
-        loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(image, gt_image))
+        _Lrgb_part = (1.0 - opt.lambda_dssim) * Ll1
+        _Lssim_part = opt.lambda_dssim * (1.0 - ssim(image, gt_image))
+        loss = _Lrgb_part + _Lssim_part
+
+        # Stage 1 Path γ: forward-tractable cancel-loss proxy (opacity intent)
+        cancel_loss = torch.tensor(0.0, device=image.device)
+        if opt.cancel_loss_lambda > 0 and iteration > opt.cancel_loss_start:
+            cancel_loss = opt.cancel_loss_lambda * L_cancel_proxy(
+                image, gt_image, gaussians.get_xyz,
+                viewpoint_cam.full_proj_transform, render_pkg['radii'],
+                K=opt.cancel_loss_K,
+                radii_min=opt.cancel_loss_radii_min
+            )
         
         # regularization
         lambda_normal = opt.lambda_normal if iteration > 7000 else 0.0
@@ -1866,7 +1893,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             normal_loss = lambda_normal * (_conf_rot_map * normal_error).mean()
             _conf_reg = ((1.0 - _conf_xyz_val) ** 2).mean() + ((1.0 - _conf_rot_val) ** 2).mean()
         # loss
-        total_loss = loss + dist_loss + normal_loss + consensus_loss + sfm_scale_loss + cvd_loss + geo_loss
+        total_loss = loss + dist_loss + normal_loss + consensus_loss + sfm_scale_loss + cvd_loss + geo_loss + cancel_loss
         if _conf_reg is not None:
             total_loss = total_loss + opt.lambda_conf_reg * _conf_reg
         if _p1_log_dir is not None:
@@ -1886,6 +1913,12 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             traj_log_cancel_v6.step(iteration, gaussians, loss, viewpoint_cam, scene.model_path)
         if opt.log_cancel_v9 and iteration % opt.log_trajectory_every == 0:
             traj_log_cancel_v9.step(iteration, gaussians, loss, viewpoint_cam, scene.model_path)
+        if iteration == opt.prune_cancel_iter and opt.prune_cancel_iter > 0:
+            cancel_prune.prune_at(iteration, gaussians, loss, scene.model_path)
+        if opt.log_cancel_perloss and iteration % opt.log_trajectory_every == 0:
+            traj_log_cancel_perloss.step(iteration, gaussians, _Lrgb_part, _Lssim_part, dist_loss if ("dist_loss" in dir() and dist_loss is not None) else None, normal_loss if ("normal_loss" in dir() and normal_loss is not None) else None, viewpoint_cam, scene.model_path)
+        if opt.log_perview and traj_log_perview.is_anchor(iteration):
+            traj_log_perview.snapshot(iteration, gaussians)
         if opt.log_cancel_v8 and iteration % opt.log_trajectory_every == 0:
             traj_log_cancel_v8.step(iteration, gaussians, loss, viewpoint_cam, scene.model_path)
         if opt.log_cancel_v5 and iteration % opt.log_trajectory_every == 0:
@@ -2129,6 +2162,11 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 progress_bar.update(10)
             if iteration == opt.iterations:
                 progress_bar.close()
+                if opt.mid_intervene_mode != "none":
+                    import numpy as np
+                    fp = os.path.join(scene.model_path, "final_state.npz")
+                    np.savez(fp, gauss_id=gaussians.gauss_id.cpu().numpy(), opacity_logit=gaussians._opacity.detach().cpu().numpy().squeeze(), xyz=gaussians.get_xyz.detach().cpu().numpy(), scale=gaussians.get_scaling.detach().cpu().numpy())
+                    print(f"saved final_state to {fp}", flush=True)
                 if opt.log_per_gauss_v2: traj_log_v2.finalize()
                 if opt.log_cancellation: traj_log_cancel.finalize()
                 if opt.log_cancel_v3: traj_log_cancel_v3.finalize()
@@ -2139,6 +2177,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 if opt.log_cancel_v8: traj_log_cancel_v8.finalize()
                 if opt.log_cancel_v9: traj_log_cancel_v9.finalize()
                 if opt.log_cancel_v10: traj_log_cancel_v10.finalize()
+                if opt.log_cancel_v11: traj_log_cancel_v11.finalize()
+                if opt.log_cancel_perloss: traj_log_cancel_perloss.finalize()
 
             # Log and save
             if tb_writer is not None:
@@ -2237,7 +2277,29 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             # Densification
             if iteration < opt.densify_until_iter:
                 gaussians.max_radii2D[visibility_filter] = torch.max(gaussians.max_radii2D[visibility_filter], radii[visibility_filter])
-                gaussians.add_densification_stats(viewspace_point_tensor, visibility_filter)
+                # Phase 1: AbsGS uses CUDA mean2D buffer (per-pixel L2 norm sum) for accum
+                if opt.densify_method == 'AbsGS':
+                    import diff_surfel_rasterization as _dsr_abs
+                    _bab = _dsr_abs.get_cancel_buffers()
+                    _abs_g = _bab.get('mean2D', None)
+                    if _abs_g is not None:
+                        gaussians.xyz_gradient_accum[visibility_filter] += _abs_g[visibility_filter].unsqueeze(-1)
+                        gaussians.denom[visibility_filter] += 1
+                    else:
+                        gaussians.add_densification_stats(viewspace_point_tensor, visibility_filter)
+                else:
+                    gaussians.add_densification_stats(viewspace_point_tensor, visibility_filter)
+                # Candidate 5 / Phase 1 cancel methods: accumulate cm_op
+                if opt.cancel_composite_densify or opt.densify_method in ('OR_cancel', 'AND_cancel'):
+                    import diff_surfel_rasterization as _dsr
+                    _b = _dsr.get_cancel_buffers()
+                    _sm = _b.get('opacity', None)
+                    if _sm is not None and gaussians._opacity.grad is not None:
+                        _alpha = torch.sigmoid(gaussians._opacity.squeeze())
+                        _sigp = _alpha * (1.0 - _alpha)
+                        _sg = (gaussians._opacity.grad.squeeze() / (_sigp + 1e-12)).abs()
+                        _cm = 1.0 - _sg / (_sm + 1e-12)
+                        gaussians.accumulate_cm(_cm)
 
                 if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
                     size_threshold = 20 if iteration > opt.opacity_reset_interval else None
@@ -2264,10 +2326,125 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                         traj_log_cancel_v7.log_at_densify(iteration, gaussians, opt.densify_grad_threshold, opt.opacity_cull, scene.cameras_extent, scene.model_path)
                     if opt.log_cancel_v10:
                         traj_log_cancel_v10.log_at_densify(iteration, gaussians, opt.densify_grad_threshold, opt.opacity_cull, scene.cameras_extent, scene.model_path)
-                    gaussians.densify_and_prune(opt.densify_grad_threshold, opt.opacity_cull, scene.cameras_extent, size_threshold, consistency_mask=cons_mask, scale_normalize=opt.scale_normalize, confidence_gated_densify=opt.confidence_gated_densify, confidence_scores=sc_conf if (opt.scale_confidence_split and sc_conf is not None) else conf_scores, scale_confidence_split=opt.scale_confidence_split, sc_scale_percentile=opt.sc_scale_percentile, sc_conf_threshold=opt.sc_conf_threshold, sc_max_count=opt.sc_max_count)
+                    if opt.log_cancel_v11:
+                        traj_log_cancel_v11.log_at_densify(iteration, gaussians)
+                    _cancel_factor = None
+                    _cancel_thresh = opt.densify_grad_threshold
+                    if opt.cancel_composite_densify and gaussians.cm_accum is not None and gaussians.cm_count > 0:
+                        _cancel_factor = (gaussians.cm_accum / gaussians.cm_count).detach()
+                        _cancel_thresh = opt.cancel_composite_grad_threshold
+                    # Phase 1 cancel methods: pass cm_avg even without composite mode
+                    if opt.densify_method in ('OR_cancel', 'AND_cancel') and gaussians.cm_accum is not None and gaussians.cm_count > 0:
+                        _cancel_factor = (gaussians.cm_accum / gaussians.cm_count).detach()
+                    # Cancel-as-split-direction (Phase 2)
+                    _split_dirs = None
+                    _split_bias_dirs = None
+                    _split_argmin_offsets = None
+                    if opt.split_method != 'V':
+                        with torch.no_grad():
+                            P_g = gaussians._xyz.shape[0]
+                            grads_pre = (gaussians.xyz_gradient_accum / gaussians.denom).squeeze()
+                            grads_pre[grads_pre != grads_pre] = 0
+                            candidate_mask = grads_pre > opt.densify_grad_threshold
+                            if candidate_mask.sum() > 0:
+                                residual_map = (image - gt_image).sum(dim=0)
+                                if opt.split_method == 'cancel':
+                                    _split_dirs = compute_cancel_directions(
+                                        gaussians.get_xyz, render_pkg['radii'],
+                                        viewpoint_cam.full_proj_transform, viewpoint_cam.world_view_transform,
+                                        __import__("math").tan(viewpoint_cam.FoVx*0.5), __import__("math").tan(viewpoint_cam.FoVy*0.5),
+                                        residual_map, candidate_mask=candidate_mask)
+                                elif opt.split_method == 'random_dir':
+                                    _split_dirs = sample_random_unit_directions(P_g, candidate_mask, image.device, seed=opt.method_random_seed + iteration)
+                                elif opt.split_method == 'orthogonal_dir':
+                                    _c_dirs = compute_cancel_directions(
+                                        gaussians.get_xyz, render_pkg['radii'],
+                                        viewpoint_cam.full_proj_transform, viewpoint_cam.world_view_transform,
+                                        __import__("math").tan(viewpoint_cam.FoVx*0.5), __import__("math").tan(viewpoint_cam.FoVy*0.5),
+                                        residual_map, candidate_mask=candidate_mask)
+                                    _split_dirs = orthogonalize_directions(_c_dirs, candidate_mask, seed=opt.method_random_seed + iteration)
+                                elif opt.split_method == 'cancel_in_plane':
+                                    _c_dirs = compute_cancel_directions(
+                                        gaussians.get_xyz, render_pkg['radii'],
+                                        viewpoint_cam.full_proj_transform, viewpoint_cam.world_view_transform,
+                                        __import__("math").tan(viewpoint_cam.FoVx*0.5), __import__("math").tan(viewpoint_cam.FoVy*0.5),
+                                        residual_map, candidate_mask=candidate_mask)
+                                    _split_dirs = project_to_tangent_plane(_c_dirs, gaussians._rotation)
+                                elif opt.split_method == 'cancel_bias_vanilla':
+                                    _c_dirs = compute_cancel_directions(
+                                        gaussians.get_xyz, render_pkg['radii'],
+                                        viewpoint_cam.full_proj_transform, viewpoint_cam.world_view_transform,
+                                        __import__("math").tan(viewpoint_cam.FoVx*0.5), __import__("math").tan(viewpoint_cam.FoVy*0.5),
+                                        residual_map, candidate_mask=candidate_mask)
+                                    _split_bias_dirs = project_to_tangent_plane(_c_dirs, gaussians._rotation)
+                                    _split_dirs = None  # don't trigger mirror branch
+                                elif opt.split_method == 'cancel_argmin':
+                                    _raw = compute_cancel_argmin_offsets(
+                                        gaussians.get_xyz, render_pkg['radii'],
+                                        viewpoint_cam.full_proj_transform, viewpoint_cam.world_view_transform,
+                                        __import__("math").tan(viewpoint_cam.FoVx*0.5), __import__("math").tan(viewpoint_cam.FoVy*0.5),
+                                        residual_map, candidate_mask=candidate_mask)
+                                    _tang = project_to_tangent_plane_keep_magnitude(_raw, gaussians._rotation)
+                                    _split_argmin_offsets = clamp_offset_to_parent_footprint(
+                                        _tang, gaussians.get_scaling, clamp_factor=opt.argmin_clamp_factor)
+                                    _split_dirs = None
+                                elif opt.split_method == 'cancel_argmin_dir_random':
+                                    _raw = compute_cancel_argmin_offsets(
+                                        gaussians.get_xyz, render_pkg['radii'],
+                                        viewpoint_cam.full_proj_transform, viewpoint_cam.world_view_transform,
+                                        __import__("math").tan(viewpoint_cam.FoVx*0.5), __import__("math").tan(viewpoint_cam.FoVy*0.5),
+                                        residual_map, candidate_mask=candidate_mask)
+                                    _tang = project_to_tangent_plane_keep_magnitude(_raw, gaussians._rotation)
+                                    _argmin_clamped = clamp_offset_to_parent_footprint(
+                                        _tang, gaussians.get_scaling, clamp_factor=opt.argmin_clamp_factor)
+                                    _mag = _argmin_clamped.norm(dim=-1, keepdim=True)
+                                    _rand_dir = sample_tangent_random_directions(
+                                        P_g, candidate_mask, gaussians._rotation, image.device,
+                                        seed=opt.method_random_seed + iteration)
+                                    _split_argmin_offsets = _rand_dir * _mag
+                                    _split_dirs = None
+                    gaussians.densify_and_prune(_cancel_thresh, opt.opacity_cull, scene.cameras_extent, size_threshold, consistency_mask=cons_mask, scale_normalize=opt.scale_normalize, confidence_gated_densify=opt.confidence_gated_densify, confidence_scores=sc_conf if (opt.scale_confidence_split and sc_conf is not None) else conf_scores, scale_confidence_split=opt.scale_confidence_split, sc_scale_percentile=opt.sc_scale_percentile, sc_conf_threshold=opt.sc_conf_threshold, sc_max_count=opt.sc_max_count, cancel_composite_factor=_cancel_factor, densify_method=opt.densify_method, cancel_rank_threshold=opt.cancel_rank_threshold, method_random_seed=opt.method_random_seed, split_directions=_split_dirs, split_bias_dirs=_split_bias_dirs, bias_lambda=0.5, split_argmin_offsets=_split_argmin_offsets)
+                    if opt.cancel_composite_densify or opt.densify_method in ('OR_cancel', 'AND_cancel'):
+                        gaussians.reset_cm_accum()
                 
                 if iteration % opt.opacity_reset_interval == 0 or (dataset.white_background and iteration == opt.densify_from_iter):
                     gaussians.reset_opacity()
+                if opt.mid_intervene_mode != "none" and iteration >= opt.mid_intervene_start and iteration <= opt.mid_intervene_end and (iteration - opt.mid_intervene_start) % opt.mid_intervene_step == 0:
+                    import importlib
+                    mim_name = getattr(opt,'mid_intervene_module','mid_intervene_render') or 'mid_intervene_render'
+                    mim = importlib.import_module(mim_name)
+                    with torch.enable_grad():
+                        mim.apply(iteration, gaussians, scene, pipe, background, opt.mid_intervene_mode, log_path=os.path.join(scene.model_path, "mid_intervene_log.json"))
+
+
+            # F: cancel amplification (per-gauss grad scaling)
+            if opt.cancel_amplify_gamma > 0 and iteration >= opt.cancel_amplify_start:
+                if iteration % opt.cancel_amplify_interval == 0:
+                    from cancel_amplify_helper import measure_cancel_mask
+                    _saved = []
+                    for _p in [gaussians._xyz, gaussians._rotation, gaussians._scaling,
+                               gaussians._opacity, gaussians._features_dc, gaussians._features_rest]:
+                        _saved.append(_p.grad.clone() if _p.grad is not None else None)
+                    with torch.enable_grad():
+                        cancel_amp_mask = measure_cancel_mask(
+                            gaussians, scene, pipe, background,
+                            cm_thr=opt.cancel_amplify_cm_thr,
+                            g_abs_mean_min=opt.cancel_amplify_g_abs_mean_min,
+                            nr_min=opt.cancel_amplify_nr_min)
+                    for _p, _gv in zip([gaussians._xyz, gaussians._rotation, gaussians._scaling,
+                                        gaussians._opacity, gaussians._features_dc, gaussians._features_rest], _saved):
+                        if _gv is None:
+                            _p.grad = None
+                        else:
+                            if _p.grad is None: _p.grad = _gv
+                            else: _p.grad.copy_(_gv)
+                    print(f'[CancelAmp@{iteration}] measured cancel mask: {int(cancel_amp_mask.sum().item())}/{cancel_amp_mask.shape[0]} gauss flagged', flush=True)
+                if cancel_amp_mask is not None and cancel_amp_mask.shape[0] == gaussians._xyz.shape[0]:
+                    from cancel_amplify_helper import amplify_grads_inplace
+                    amplify_grads_inplace(gaussians, cancel_amp_mask, opt.cancel_amplify_gamma)
+                elif cancel_amp_mask is not None:
+                    # gauss count changed (densify), invalidate mask
+                    cancel_amp_mask = None
 
             # Optimizer step
             if iteration < opt.iterations:

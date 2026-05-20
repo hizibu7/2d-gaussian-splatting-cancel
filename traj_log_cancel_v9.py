@@ -2,7 +2,7 @@ import os, time, torch
 import numpy as np
 import diff_surfel_rasterization as dsr
 _S={"init":False,"data":[],"out":None,"elapsed":0.0,"calls":0}
-def step(it, g, photo_loss, viewpoint_cam, mp, K=1000):
+def step(it, g, photo_loss, viewpoint_cam, mp, K=int(__import__("os").environ.get("CV9_K",1000))):
     if not _S["init"]:
         os.makedirs(mp, exist_ok=True)
         _S["out"]=os.path.join(mp,"cancellation_v9.npz"); _S["init"]=True

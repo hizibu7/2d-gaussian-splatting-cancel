@@ -42,7 +42,7 @@ if __name__ == "__main__":
     parser.add_argument("--num_cluster", default=50, type=int, help='Mesh: number of connected clusters to export')
     parser.add_argument("--unbounded", action="store_true", help='Mesh: using unbounded mode for meshing')
     parser.add_argument("--mesh_res", default=1024, type=int, help='Mesh: resolution for unbounded mesh extraction')
-    parser.add_argument("--confidence_tsdf", action="store_true", help='Mesh: mask low-confidence pixels in TSDF')
+    parser.add_argument("--cancel_npz", default="", type=str, help="path to npz with per-Gauss cancel"); parser.add_argument("--confidence_tsdf", action="store_true", help='Mesh: mask low-confidence pixels in TSDF')
     parser.add_argument("--conf_tsdf_threshold", default=0.3, type=float, help='Mesh: confidence threshold for TSDF masking')
     parser.add_argument("--dbc_alpha", default=0.0, type=float, help='Mesh: depth bias correction alpha (0=off)')
     parser.add_argument("--dwf_tau", default=0.0, type=float, help='Mesh: discrepancy-weighted fusion threshold (0=off)')
@@ -96,7 +96,18 @@ if __name__ == "__main__":
 
         # Compute per-view confidence maps if confidence_tsdf is enabled
         confidence_maps = None
-        if args.confidence_tsdf:
+        if args.cancel_npz:
+            print(f'Loading cancel from {args.cancel_npz}')
+            import numpy as _np
+            _d=_np.load(args.cancel_npz)
+            _c=torch.from_numpy(_d["cancel"]).float().cuda()
+            conf_per_g=(1.0-_c).clamp(0,1)
+            conf_color=conf_per_g.unsqueeze(1).expand(-1,3)
+            confidence_maps=[]
+            for viewpoint_cam in tqdm(scene.getTrainCameras(), desc="cc"):
+                conf_pkg=render(viewpoint_cam, gaussians, pipe, background, override_color=conf_color)
+                confidence_maps.append(conf_pkg["render"][0:1].cpu())
+        elif args.confidence_tsdf:
             print("Computing confidence maps for TSDF masking ...")
             from train import compute_multi_signal_confidence
             from functools import partial as fpartial

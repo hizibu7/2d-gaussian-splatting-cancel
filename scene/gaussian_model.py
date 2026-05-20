@@ -52,6 +52,9 @@ class GaussianModel:
         self._opacity = torch.empty(0)
         self.max_radii2D = torch.empty(0)
         self.xyz_gradient_accum = torch.empty(0)
+        # Cancel-composite densification (Candidate 5) buffer
+        self.cm_accum = None
+        self.cm_count = 0
         self.denom = torch.empty(0)
         self.cumulative_view_count = torch.empty(0)  # Never reset, tracks total visibility
         self.sfm_nn_distance = torch.empty(0)
@@ -392,7 +395,7 @@ class GaussianModel:
                 new_init_scale = self.get_scaling[-n_new:].detach().clone()
                 self.initial_scale = torch.cat([self.initial_scale, new_init_scale], dim=0)
 
-    def densify_and_split(self, grads, grad_threshold, scene_extent, N=2, force_split_mask=None):
+    def densify_and_split(self, grads, grad_threshold, scene_extent, N=2, force_split_mask=None, split_directions=None, split_bias_dirs=None, bias_lambda=0.5, split_argmin_offsets=None):
         n_init_points = self.get_xyz.shape[0]
         # Extract points that satisfy the gradient condition
         padded_grad = torch.zeros((n_init_points), device="cuda")
@@ -406,12 +409,74 @@ class GaussianModel:
             padded_force[:force_split_mask.shape[0]] = force_split_mask
             selected_pts_mask = torch.logical_or(selected_pts_mask, padded_force)
 
-        stds = self.get_scaling[selected_pts_mask].repeat(N,1)
-        stds = torch.cat([stds, 0 * torch.ones_like(stds[:,:1])], dim=-1)
-        means = torch.zeros_like(stds)
-        samples = torch.normal(mean=means, std=stds)
-        rots = build_rotation(self._rotation[selected_pts_mask]).repeat(N,1,1)
-        new_xyz = torch.bmm(rots, samples.unsqueeze(-1)).squeeze(-1) + self.get_xyz[selected_pts_mask].repeat(N, 1)
+        if split_directions is not None:
+            # Directional split: children at parent ± direction × offset_magnitude
+            n_init = self.get_xyz.shape[0]
+            padded_dirs = torch.zeros((n_init, 3), device='cuda')
+            padded_dirs[:split_directions.shape[0]] = split_directions
+            sel_dirs = padded_dirs[selected_pts_mask]  # (n_sel, 3)
+            sel_max_scale = self.get_scaling[selected_pts_mask].max(dim=1, keepdim=True).values  # (n_sel, 1)
+            offset = sel_dirs * sel_max_scale  # (n_sel, 3)
+            parent_xyz = self.get_xyz[selected_pts_mask]  # (n_sel, 3)
+            new_xyz_chunks = []
+            for i in range(N):
+                sign = 1.0 if i == 0 else -1.0
+                if N > 2:  # fallback: scale sign for >2 splits
+                    sign = (2.0 * i / (N - 1)) - 1.0
+                new_xyz_chunks.append(parent_xyz + sign * offset)
+            new_xyz = torch.cat(new_xyz_chunks, dim=0)
+        elif split_bias_dirs is not None:
+            # Vanilla mechanism (anisotropic Gaussian, in-plane) with biased mean toward ±cancel direction
+            n_init = self.get_xyz.shape[0]
+            padded_bias = torch.zeros((n_init, 3), device='cuda')
+            padded_bias[:split_bias_dirs.shape[0]] = split_bias_dirs  # tangent-plane world-coord unit dirs
+            sel_bias_world = padded_bias[selected_pts_mask]  # (n_sel, 3)
+            R_sel = build_rotation(self._rotation[selected_pts_mask])  # (n_sel, 3, 3)
+            # World → local frame: bias_local = R.T @ bias_world. After tangent-plane projection, 3rd dim ≈ 0.
+            bias_local = torch.bmm(R_sel.transpose(1, 2), sel_bias_world.unsqueeze(-1)).squeeze(-1)  # (n_sel, 3)
+            max_inplane = self.get_scaling[selected_pts_mask].max(dim=1, keepdim=True).values  # (n_sel, 1)
+            mean_bias_per_gauss = bias_local * max_inplane * bias_lambda  # (n_sel, 3)
+            # ±mirror: child 0 gets +bias, child 1 gets -bias (still stochastic around each pole)
+            mean_chunks = []
+            for i in range(N):
+                sign = 1.0 if i == 0 else -1.0
+                if N > 2:
+                    sign = (2.0 * i / (N - 1)) - 1.0
+                mean_chunks.append(sign * mean_bias_per_gauss)
+            means = torch.cat(mean_chunks, dim=0)  # (n_sel*N, 3)
+            stds = self.get_scaling[selected_pts_mask].repeat(N, 1)
+            stds = torch.cat([stds, 0 * torch.ones_like(stds[:,:1])], dim=-1)
+            samples = torch.normal(mean=means, std=stds)  # local-frame samples around ±bias
+            rots = R_sel.repeat(N, 1, 1)
+            new_xyz = torch.bmm(rots, samples.unsqueeze(-1)).squeeze(-1) + self.get_xyz[selected_pts_mask].repeat(N, 1)
+        elif split_argmin_offsets is not None:
+            # cancel_argmin / cancel_argmin_dir_random: vanilla anisotropic stochastic noise (independent per child) + ±world-frame δ mirror.
+            n_init = self.get_xyz.shape[0]
+            padded_off = torch.zeros((n_init, 3), device='cuda')
+            padded_off[:split_argmin_offsets.shape[0]] = split_argmin_offsets
+            sel_off_world = padded_off[selected_pts_mask]  # (n_sel, 3), already tangent-projected + clamped
+            stds_arg = self.get_scaling[selected_pts_mask].repeat(N, 1)
+            stds_arg = torch.cat([stds_arg, 0 * torch.ones_like(stds_arg[:, :1])], dim=-1)
+            means_zero = torch.zeros_like(stds_arg)
+            samples_arg = torch.normal(mean=means_zero, std=stds_arg)  # element-wise independent
+            rots_arg = build_rotation(self._rotation[selected_pts_mask]).repeat(N, 1, 1)
+            noise_world = torch.bmm(rots_arg, samples_arg.unsqueeze(-1)).squeeze(-1)  # (n_sel*N, 3)
+            delta_chunks = []
+            for i in range(N):
+                sgn = 1.0 if i == 0 else -1.0
+                if N > 2:
+                    sgn = (2.0 * i / (N - 1)) - 1.0
+                delta_chunks.append(sgn * sel_off_world)
+            delta_world = torch.cat(delta_chunks, dim=0)  # (n_sel*N, 3)
+            parent_world = self.get_xyz[selected_pts_mask].repeat(N, 1)
+            new_xyz = parent_world + noise_world + delta_world
+        else:
+            stds = self.get_scaling[selected_pts_mask].repeat(N,1)
+            stds = torch.cat([stds, 0 * torch.ones_like(stds[:,:1])], dim=-1)
+            means = torch.zeros_like(stds)
+            samples = torch.normal(mean=means, std=stds)
+            rots = build_rotation(self._rotation[selected_pts_mask]).repeat(N,1,1)
+            new_xyz = torch.bmm(rots, samples.unsqueeze(-1)).squeeze(-1) + self.get_xyz[selected_pts_mask].repeat(N, 1)
         new_scaling = self.scaling_inverse_activation(self.get_scaling[selected_pts_mask].repeat(N,1) / (0.8*N))
         new_rotation = self._rotation[selected_pts_mask].repeat(N,1)
         new_features_dc = self._features_dc[selected_pts_mask].repeat(N,1,1)
@@ -448,9 +513,28 @@ class GaussianModel:
         if _clone_sfm_nn is not None:
             self.sfm_nn_distance = torch.cat([self.sfm_nn_distance, _clone_sfm_nn])
 
-    def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size, consistency_mask=None, scale_normalize=False, confidence_gated_densify=False, confidence_scores=None, scale_confidence_split=False, sc_scale_percentile=90, sc_conf_threshold=0.3, sc_max_count=500):
+    def accumulate_cm(self, cm_per_gauss):
+        """Accumulate per-Gauss cancel cm (detached). Resets size if mismatch."""
+        cm_d = cm_per_gauss.detach()
+        if self.cm_accum is None or self.cm_accum.shape[0] != cm_d.shape[0]:
+            self.cm_accum = cm_d.clone()
+            self.cm_count = 1
+        else:
+            self.cm_accum += cm_d
+            self.cm_count += 1
+
+    def reset_cm_accum(self):
+        self.cm_accum = None
+        self.cm_count = 0
+
+    def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size, consistency_mask=None, scale_normalize=False, confidence_gated_densify=False, confidence_scores=None, scale_confidence_split=False, sc_scale_percentile=90, sc_conf_threshold=0.3, sc_max_count=500, cancel_composite_factor=None, densify_method='V', cancel_rank_threshold=0.7, method_random_seed=0, split_directions=None, split_bias_dirs=None, bias_lambda=0.5, split_argmin_offsets=None):
         grads = self.xyz_gradient_accum / self.denom
         grads[grads.isnan()] = 0.0
+        # Candidate 5: composite criterion grads * cm_avg  (LEGACY: V mode only with explicit cancel_composite_densify)
+        if cancel_composite_factor is not None and densify_method == 'V':
+            cm_avg = cancel_composite_factor
+            n = min(grads.shape[0], cm_avg.shape[0])
+            grads[:n] = grads[:n] * cm_avg[:n].unsqueeze(-1)
 
         # Scale-normalized gradient: compensate for gradient attenuation in large Gaussians
         if scale_normalize:
@@ -503,8 +587,58 @@ class GaussianModel:
                 new_mask[candidates[topk_idx]] = True
                 force_mask = new_mask
 
+        # Phase 1 method dispatch: mask grads to control which Gauss are eligible to split
+        if densify_method != 'V' and densify_method != 'AbsGS':
+            n = grads.shape[0]
+            dev = grads.device
+            vanilla_mask = (grads.squeeze() > max_grad)
+            cm_a = cancel_composite_factor if cancel_composite_factor is not None else torch.zeros(n, device=dev)
+            if cm_a.shape[0] < n:
+                cm_a = torch.cat([cm_a, torch.zeros(n - cm_a.shape[0], device=dev)])
+            elif cm_a.shape[0] > n:
+                cm_a = cm_a[:n]
+            if densify_method == 'OR_cancel':
+                nv_idx = torch.where(~vanilla_mask)[0]
+                if len(nv_idx) > 0:
+                    k = max(1, int(len(nv_idx) * (1 - cancel_rank_threshold)))
+                    _, top = cm_a[nv_idx].topk(k)
+                    add = torch.zeros(n, dtype=torch.bool, device=dev); add[nv_idx[top]] = True
+                    eligible = vanilla_mask | add
+                else: eligible = vanilla_mask
+            elif densify_method == 'OR_random':
+                nv_idx = torch.where(~vanilla_mask)[0]
+                if len(nv_idx) > 0:
+                    k = max(1, int(len(nv_idx) * (1 - cancel_rank_threshold)))
+                    gen = torch.Generator(device=dev).manual_seed(method_random_seed)
+                    perm = torch.randperm(len(nv_idx), generator=gen, device=dev)[:k]
+                    add = torch.zeros(n, dtype=torch.bool, device=dev); add[nv_idx[perm]] = True
+                    eligible = vanilla_mask | add
+                else: eligible = vanilla_mask
+            elif densify_method == 'AND_cancel':
+                v_idx = torch.where(vanilla_mask)[0]
+                if len(v_idx) > 0:
+                    k = max(1, int(len(v_idx) * (1 - cancel_rank_threshold)))
+                    _, top = cm_a[v_idx].topk(k)
+                    keep = torch.zeros(n, dtype=torch.bool, device=dev); keep[v_idx[top]] = True
+                    eligible = keep
+                else: eligible = vanilla_mask
+            elif densify_method == 'AND_random':
+                v_idx = torch.where(vanilla_mask)[0]
+                if len(v_idx) > 0:
+                    k = max(1, int(len(v_idx) * (1 - cancel_rank_threshold)))
+                    gen = torch.Generator(device=dev).manual_seed(method_random_seed)
+                    perm = torch.randperm(len(v_idx), generator=gen, device=dev)[:k]
+                    keep = torch.zeros(n, dtype=torch.bool, device=dev); keep[v_idx[perm]] = True
+                    eligible = keep
+                else: eligible = vanilla_mask
+            else:
+                eligible = vanilla_mask
+            # Zero out grads for ineligible -> vanilla densify_and_clone/split won't trigger
+            grads_phase1 = grads.clone()
+            grads_phase1[~eligible] = 0.0
+            grads = grads_phase1
         self.densify_and_clone(grads, max_grad, extent)
-        self.densify_and_split(grads, max_grad, extent, force_split_mask=force_mask)
+        self.densify_and_split(grads, max_grad, extent, force_split_mask=force_mask, split_directions=split_directions, split_bias_dirs=split_bias_dirs, bias_lambda=bias_lambda, split_argmin_offsets=split_argmin_offsets)
 
         prune_mask = (self.get_opacity < min_opacity).squeeze()
         if max_screen_size:
