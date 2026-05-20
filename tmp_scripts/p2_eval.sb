@@ -1,0 +1,75 @@
+#!/bin/bash
+#SBATCH --job-name=p2eval
+#SBATCH --output=logs/p2eval_%j.log
+#SBATCH --error=logs/p2eval_%j.log
+#SBATCH --time=04:00:00
+#SBATCH --partition=batch_ce_ugrad
+#SBATCH --gres=gpu:1
+#SBATCH --mem=96G
+#SBATCH --cpus-per-task=4
+#SBATCH --exclude=moana-r1,moana-r2,moana-u7,moana-u8
+
+set -e
+set -o pipefail
+source /data/hizibu7/anaconda3/etc/profile.d/conda.sh
+conda activate 2dgs
+cd /data/hizibu7/repos/Seraph/2d-gaussian-splatting
+
+DTU_OFFICIAL="data/DTU_Official/SampleSet/MVS Data"
+SCAN_ID=3
+
+TARGET_METHOD=${1:-all}
+TARGET_SEED=${2:-all}
+
+for METHOD in V cancel random_dir orthogonal_dir cancel_in_plane; do
+  [ "$TARGET_METHOD" != "all" ] && [ "$TARGET_METHOD" != "$METHOD" ] && continue
+  for SEED in 0 1 2; do
+    [ "$TARGET_SEED" != "all" ] && [ "$TARGET_SEED" != "$SEED" ] && continue
+    OUT=eval/p2_${METHOD}_seed${SEED}_scan3
+    if [ ! -d "$OUT/point_cloud/iteration_30000" ]; then
+      echo "[SKIP missing] $OUT (no 30K ckpt)"
+      continue
+    fi
+
+    echo ""
+    echo "================================================================"
+    echo "=== EVAL: $OUT ($(date)) ==="
+    echo "================================================================"
+
+    MESH_DIR=$OUT/train/ours_30000
+    POSTMESH=$MESH_DIR/fuse_post.ply
+
+    if [ ! -f "$POSTMESH" ]; then
+      echo "--- render+mesh extract ---"
+      python -u render.py -m $OUT --skip_test
+    else
+      echo "--- mesh exists, skip render ---"
+    fi
+
+    if [ ! -f "$POSTMESH" ]; then
+      echo "[FAIL render — no $POSTMESH produced, skipping DTU eval]"
+      continue
+    fi
+
+    DTU_OUT=$OUT/dtu_eval
+    mkdir -p $DTU_OUT
+    if [ ! -f "$DTU_OUT/results.json" ]; then
+      echo "--- DTU eval ---"
+      python -u scripts/eval_dtu/eval.py \
+        --data "$POSTMESH" \
+        --scan $SCAN_ID \
+        --mode mesh \
+        --dataset_dir "$DTU_OFFICIAL" \
+        --vis_out_dir "$DTU_OUT"
+    else
+      echo "--- DTU results.json exists, skip ---"
+    fi
+  done
+done
+
+echo ""
+echo "================================================================"
+echo "=== AGGREGATE ==="
+echo "================================================================"
+python -u tmp_scripts/p2_aggregate.py
+

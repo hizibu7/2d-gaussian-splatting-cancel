@@ -1,0 +1,18 @@
+#!/bin/bash
+#SBATCH --job-name=lgc6gr
+#SBATCH --output=/data/hizibu7/repos/Seraph/2d-gaussian-splatting/lgc6_grid_out.log
+#SBATCH --error=/data/hizibu7/repos/Seraph/2d-gaussian-splatting/lgc6_grid_err.log
+#SBATCH --time=00:30:00
+#SBATCH --partition=batch_ce_ugrad
+#SBATCH --mem=24G
+#SBATCH --gres=gpu:1
+#SBATCH --cpus-per-task=4
+#SBATCH --exclude=moana-r1,moana-r2,moana-u7,moana-u8
+
+set -e
+source /data/hizibu7/anaconda3/etc/profile.d/conda.sh
+conda activate 2dgs
+cd /data/hizibu7/repos/Seraph/2d-gaussian-splatting
+rm -rf paper_figures_v2/lgc6_all
+python lgc6_grid_all.py --nr_min 10 --cm_corr_min 0.5
+

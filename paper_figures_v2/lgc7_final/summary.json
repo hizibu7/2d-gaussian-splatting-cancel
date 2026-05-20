@@ -1,0 +1,22 @@
+{
+  "op": {
+    "mean_of_medians": 0.6694797873497009,
+    "std_of_medians": 0.07853834331035614,
+    "n_scenes_views": 27
+  },
+  "tm": {
+    "mean_of_medians": 0.6427053809165955,
+    "std_of_medians": 0.06356737017631531,
+    "n_scenes_views": 27
+  },
+  "color": {
+    "mean_of_medians": 0.6672439575195312,
+    "std_of_medians": 0.07461978495121002,
+    "n_scenes_views": 27
+  },
+  "m2d": {
+    "mean_of_medians": 0.40541499853134155,
+    "std_of_medians": 0.051706649363040924,
+    "n_scenes_views": 27
+  }
+}

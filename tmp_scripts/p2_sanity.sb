@@ -1,0 +1,26 @@
+#!/bin/bash
+#SBATCH --job-name=p2san
+#SBATCH --output=/data/hizibu7/repos/Seraph/2d-gaussian-splatting/p2_sanity_%x_out.log
+#SBATCH --error=/data/hizibu7/repos/Seraph/2d-gaussian-splatting/p2_sanity_%x_err.log
+#SBATCH --partition=batch_ce_ugrad
+#SBATCH --gres=gpu:1
+#SBATCH --time=00:20:00
+#SBATCH --mem=24G
+#SBATCH --cpus-per-task=4
+#SBATCH --exclude=moana-r1,moana-r2,moana-u7,moana-u8
+
+set -e
+source /data/hizibu7/anaconda3/etc/profile.d/conda.sh
+conda activate 2dgs
+cd /data/hizibu7/repos/Seraph/2d-gaussian-splatting
+METHOD=$1
+SRC=data/DTU/scan3
+[ -d data/DTU_Full/scan3 ] && SRC=data/DTU_Full/scan3
+[ -d data/DTU/scan3 ] && SRC=data/DTU/scan3
+OUT=eval/p2san_${METHOD}_scan3
+rm -rf ${OUT}
+python -u train.py \
+  -s ${SRC} -m ${OUT} -r 2 \
+  --iterations 3000 \
+  --split_method ${METHOD}
+

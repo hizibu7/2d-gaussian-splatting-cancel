@@ -1,0 +1,15 @@
+#!/bin/bash
+#SBATCH -J lgc6_grid
+#SBATCH -o logs/lgc6_grid_%j.log
+#SBATCH -e logs/lgc6_grid_%j.log
+#SBATCH -t 00:45:00
+#SBATCH -p batch_ce_ugrad
+#SBATCH --mem=32G
+#SBATCH --gres=gpu:1
+#SBATCH -c 4
+#SBATCH --exclude=moana-r1,moana-r2,moana-u7,moana-u8
+cd /data/hizibu7/repos/Seraph/2d-gaussian-splatting
+source /data/hizibu7/anaconda3/etc/profile.d/conda.sh
+conda activate 2dgs
+python -u lgc6_grid_all.py --cm_corr_min 0.7
+

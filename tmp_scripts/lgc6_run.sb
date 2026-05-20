@@ -1,0 +1,26 @@
+#!/bin/bash
+#SBATCH --job-name=lgc6
+#SBATCH --output=logs/lgc6_%j.log
+#SBATCH --error=logs/lgc6_%j.log
+#SBATCH --time=00:15:00
+#SBATCH --partition=batch_ce_ugrad
+#SBATCH --mem=16G
+#SBATCH --gres=gpu:1
+#SBATCH --cpus-per-task=4
+#SBATCH --exclude=moana-r1,moana-r2,moana-u7,moana-u8
+
+set -e
+source /data/hizibu7/anaconda3/etc/profile.d/conda.sh
+conda activate 2dgs
+cd /data/hizibu7/repos/Seraph/2d-gaussian-splatting
+S=$1
+V=$2
+SRC=data/DTU_Full/scan${S}
+[ -d "data/DTU/scan${S}" ] && SRC=data/DTU/scan${S}
+OUT=paper_figures_v2/lgc6_corr
+mkdir -p ${OUT}
+python -u loss_grad_cancel_v6.py \
+  -m eval/ck17_scan${S} -s ${SRC} -r 2 \
+  --iteration 17000 --view_idx ${V} \
+  --out_prefix ${OUT}/lgc6_s${S}_v${V}
+

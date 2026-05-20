@@ -1,0 +1,22 @@
+#!/bin/bash
+#SBATCH --job-name=p1ent
+#SBATCH --output=/data/hizibu7/repos/Seraph/2d-gaussian-splatting/p1_split_entropy_out.log
+#SBATCH --error=/data/hizibu7/repos/Seraph/2d-gaussian-splatting/p1_split_entropy_err.log
+#SBATCH --partition=batch_ce_ugrad
+#SBATCH --gres=gpu:1
+#SBATCH --time=00:20:00
+#SBATCH --mem=24G
+#SBATCH --cpus-per-task=4
+#SBATCH --exclude=moana-r1,moana-r2,moana-u7,moana-u8
+
+source /data/hizibu7/anaconda3/etc/profile.d/conda.sh
+conda activate 2dgs
+cd /data/hizibu7/repos/Seraph/2d-gaussian-splatting
+python p1_split_entropy.py \
+  -s data/DTU_Full/scan3 \
+  -m eval/s1b_lam00_scan3 \
+  --iteration 30000 \
+  --view_idx 0 \
+  --K 2000 \
+  --n_views_mag 50
+

@@ -1,0 +1,35 @@
+#!/bin/bash
+#SBATCH -J lgc7
+#SBATCH -o logs/lgc7_%j.log
+#SBATCH -e logs/lgc7_%j.log
+#SBATCH -t 02:30:00
+#SBATCH -p batch_ce_ugrad
+#SBATCH --mem=32G
+#SBATCH --gres=gpu:1
+#SBATCH -c 4
+#SBATCH --exclude=moana-r1,moana-r2,moana-u7,moana-u8
+set -e
+cd /data/hizibu7/repos/Seraph/2d-gaussian-splatting
+source /data/hizibu7/anaconda3/etc/profile.d/conda.sh
+conda activate 2dgs
+
+OUT=paper_figures_v2/lgc7_corr
+mkdir -p $OUT
+
+for S in 105 82 50 97 3 28 8 35 40; do
+  SRC="data/DTU_Full/scan${S}"
+  [ -d "data/DTU/scan${S}" ] && SRC="data/DTU/scan${S}"
+  for V in 0 16 32; do
+    for LOSS in dist normal; do
+      python -u loss_grad_cancel_v7.py \
+        -m eval/ck17_scan${S} -s "$SRC" -r 2 \
+        --iteration 17000 --view_idx $V \
+        --loss_kind $LOSS \
+        --out_prefix $OUT/lgc7_s${S}_v${V} 2>&1
+    done
+  done
+done
+
+echo "[lgc7] all 54 measurements done"
+ls -la $OUT/ | wc -l
+
